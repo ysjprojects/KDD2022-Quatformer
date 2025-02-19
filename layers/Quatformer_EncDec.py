@@ -34,9 +34,14 @@ class series_decomp(nn.Module):
         res = x - moving_mean
         return res, moving_mean
 
-
 class TrendNorm(nn.Module):
-
+    """
+    TrendNorm:
+      - Removes a local 'trend' component from the input sequence using a series decomposition
+      - Normalizes the detrended sequence by its std
+      - Optionally adds back a learned polynomial 'trend' of specified order
+      - This is especially helpful for time-series that have slowly-varying global or meso-scale trends
+    """
     def __init__(self,
                  dimension: int,
                  seq_len: int,
@@ -44,31 +49,86 @@ class TrendNorm(nn.Module):
                  kernel_size: int = 25,
                  eps: float = 1e-5,
                  affine: bool = True):
-
+        """
+        Args:
+            dimension: embedding dimension (E) of the input
+            seq_len: length (L) of the time-series sequence
+            order: the polynomial order for the learned trend (e.g., 1 for linear)
+            kernel_size: size for the moving average or local smoothing in detrending
+            eps: small constant for numerical stability in division
+            affine: if True, use trainable parameters (gamma, betas) to learn a polynomial trend
+        """
         super(TrendNorm, self).__init__()
+
+        # If affine=True, we learn:
+        #   - a scale parameter (gamma)
+        #   - polynomial coefficients (betas[i]) for i in [0..order]
         if affine:
+            # gamma ~ scale factor for the normalized residual
             self.gamma = nn.Parameter(torch.ones(dimension,))
-            self.register_buffer(f'position', torch.arange(0.0, seq_len, 1.0) / seq_len)
-            self.betas = nn.ParameterList([nn.Parameter(torch.zeros(dimension,)) for _ in range(order+1)])
+            
+            # Create a normalized "position" array of shape (seq_len, ),
+            # e.g., positions from 0.0 to 1.0 across the sequence.
+            self.register_buffer('position', torch.arange(0.0, seq_len, 1.0) / seq_len)
+            
+            # betas[i] ~ polynomial coefficients for position^i
+            # e.g., for order=1: betas[0], betas[1] => intercept + slope
+            self.betas = nn.ParameterList([
+                nn.Parameter(torch.zeros(dimension,)) for _ in range(order+1)
+            ])
+
+        # 'detrend' is a local smoothing or decomposition operation
+        # that returns (residual, trend) for the input series.
         self.detrend = series_decomp(kernel_size)
-        self.eps = eps
-        self.order = order
-        self.affine = affine
-        
+
+        self.eps = eps       # small epsilon for std
+        self.order = order   # polynomial order
+        self.affine = affine # whether we do polynomial + gamma scaling
+
     def forward(self, tensor: torch.Tensor):
+        """
+        Forward pass:
+          1) Detrend the input using 'series_decomp'
+          2) Normalize the residual by its std
+          3) Optionally add back a learned polynomial trend
+        Args:
+            tensor: shape (B, L, E)
+        Returns:
+            normalized: shape (B, L, E)
+        """
         B, L, E = tensor.shape
+        
+        # === 1) Detrend the sequence ===
+        # 'self.detrend' removes a local mean or smoothing from the time dimension
+        # returning a 'residual' in 'tensor' and discarding the original 'trend' in '_'
         tensor, _ = self.detrend(tensor)
+        
+        # === 2) Compute std of the residual across the time dimension (dim=1) ===
+        # We keepdim=True so we can broadcast over (B, L, E).
         std = tensor.std(1, unbiased=False, keepdim=True)
 
         if self.affine:
-            trend = torch.einsum('l,e->le',self.position**0, self.betas[0])
-            for i in range(1,self.order+1):
-                trend += torch.einsum('l,e->le',self.position**i, self.betas[i])
+            # === 3) Construct a learned polynomial trend if affine=True ===
+            # Start with the intercept: position^0 * betas[0]
+            trend = torch.einsum('l,e->le', self.position**0, self.betas[0])
+            
+            # Add higher-order terms if order > 0
+            for i in range(1, self.order+1):
+                # position^i * betas[i], then add to 'trend'
+                trend += torch.einsum('l,e->le', self.position**i, self.betas[i])
+            
+            # 'trend' is shape (L, E). Broadcast it to (B, L, E)
             trend = trend.view(1, L, E).repeat(B, 1, 1)
+            
+            # Combine:
+            #   normalized residual = gamma * (residual / (std+eps))
+            #   final output = normalized residual + polynomial trend
             return self.gamma * tensor / (std + self.eps) + trend
+        
         else:
+            # If affine=False, no learned polynomial or gamma
+            # => just do standard "residual / std"
             return tensor / (std + self.eps)
-
 
 class EncoderLayer(nn.Module):
     """
